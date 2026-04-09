@@ -9,8 +9,8 @@ from clapDetector import ClapDetector
 WEBHOOK_URL = "http://192.168.50.76:5678/webhook/clap"
 
 THRESHOLD_BIAS = 9000
-LOWCUT         = 200
-HIGHCUT        = 3200
+LOWCUT         = 600
+HIGHCUT        = 4000
 
 # Set to True to log every non-empty detector result with full repr,
 # including counts the webhook ignores (0, 4+). Useful for tuning.
