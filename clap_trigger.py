@@ -109,8 +109,14 @@ CLASSIFIER_MID_BAND_HI_HZ  = 4000.0  # widened from 2000 to capture snappy/high-
 
 # ── Sequence detection (1/2/3 clap counting) ────────────────────────────────
 
-CLAP_INTERVAL_S    = 0.5    # max gap between claps in one sequence
-SEQUENCE_TIMEOUT_S = 0.6    # finalize a sequence after this much silence
+CLAP_INTERVAL_S    = 0.7    # max gap between consecutive claps in one sequence.
+                             # Bumped from 0.5 after observing that natural 3-clap
+                             # sequences can have 500-600 ms gaps between adjacent claps,
+                             # causing the third clap to start a new singleton sequence
+                             # instead of joining the existing one.
+SEQUENCE_TIMEOUT_S = 0.8    # finalize a sequence after this much silence after the last
+                             # clap. Must be > CLAP_INTERVAL_S so the interval check
+                             # gets a chance to fire before the timeout does.
 VALID_COUNTS       = (1, 2, 3)
 
 
