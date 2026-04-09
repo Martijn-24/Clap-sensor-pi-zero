@@ -8,7 +8,7 @@ from clapDetector import ClapDetector
 
 WEBHOOK_URL = "http://192.168.50.76:5678/webhook/clap"
 
-THRESHOLD_BIAS = 6000
+THRESHOLD_BIAS = 9000
 LOWCUT         = 200
 HIGHCUT        = 3200
 
