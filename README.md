@@ -55,28 +55,37 @@ useful threshold.
 The fix is to switch from "filter then peak-detect" to "windowed spectral
 classification". When the gate fires on a loud event, we grab a 4096-sample
 (~93 ms) window of audio around it, FFT it, and look at the steady-state
-spectral content. Real claps and slams have completely different spectra
-when measured this way:
+spectral content. Real claps and slams have measurably different spectra
+when measured this way — but the separation depends on **distance and room
+acoustics**, so we use a 2-clause rule that handles two distinct clap regimes:
 
-| Feature | Real claps | Door slams / stomps |
-|---|---|---|
-| Spectral centroid | 735–2651 Hz | 8–1149 Hz |
-| Energy below 500 Hz | 3–32% | 47–100% |
-| Energy in 500–4000 Hz | 67–94% | 0–43% |
+| Feature | Point-blank claps (~30cm) | Real-world claps (varying distance) | Door slams / stomps |
+|---|---|---|---|
+| Spectral centroid | 735–1295 Hz | **1450–2039 Hz** | 8–1149 Hz |
+| Energy below 500 Hz | 7–24% | 0.6–12% | 47–100% |
+| Energy in 500–4000 Hz | **61–88%** | 33.9–73.7% | 0–43% |
 
-(Numbers from offline analysis of three ~45 second test recordings on this
-exact mic and room.)
+(Numbers from offline analysis of four reference recordings on the actual
+mic and in the actual room — see "Validation history" below.)
 
-The classifier requires **all three** of:
+The classifier accepts an event as a clap if **EITHER** clause holds:
 
-- `centroid >= 600 Hz`
-- `low_pct <= 60%` (energy below 500 Hz)
-- `mid_pct >= 60%` (energy in 500–4000 Hz)
+- **Clause A** (real-world claps): `centroid >= 1300 Hz`
+- **Clause B** (point-blank claps): `centroid >= 600 Hz AND mid_pct >= 60%`
 
-Mid-band energy is the primary discriminator — there's a 24-point gap
-between the worst real clap (67%) and the worst false-positive slam (43%).
-The other two checks are belt-and-suspenders against edge cases the
-recordings might not have captured.
+Plus a `low_pct <= 60%` backstop to reject very-low-frequency events that
+slipped through both clauses.
+
+Why 2 clauses? Real-world claps from across a room push their spectral
+energy higher (centroid > 1450 Hz) but spread it across more bands
+(mid_pct varies 34-74%). Close-mic claps have moderate centroid (735-1295
+Hz) but a tightly concentrated mid-band (mid_pct 61-88%). No single 1D
+threshold separates both clap regimes from slams. The disjunctive rule
+handles both.
+
+Slams fail both clauses: their max centroid (1149 Hz) is below clause A's
+1300 Hz floor, and their max mid_pct (43%) is below clause B's 60% floor.
+There is comfortable separation on both axes.
 
 ### Sequence detection (1, 2, 3 claps)
 
@@ -100,16 +109,50 @@ constant blocks. The most important ones:
 | Constant | What it controls |
 |---|---|
 | `WEBHOOK_URL` | Where the POST goes |
-| `CLASSIFIER_CENTROID_MIN_HZ` | Minimum spectral centroid for "this is a clap" |
-| `CLASSIFIER_LOW_PCT_MAX` | Maximum below-500 Hz energy ratio |
-| `CLASSIFIER_MID_PCT_MIN` | Minimum 500–4000 Hz energy ratio |
-| `CLAP_INTERVAL_S` | Max gap between claps in one sequence |
-| `SEQUENCE_TIMEOUT_S` | Silence after last clap before sequence finalizes |
+| `GATE_OPEN_THRESHOLD` | RMS above which the gate fires (currently 0.04) |
+| `GATE_CLOSE_THRESHOLD` | RMS below which the gate re-arms (currently 0.02) |
+| `CLASSIFIER_CENTROID_HIGH_MIN_HZ` | Clause A centroid floor (currently 1300) |
+| `CLASSIFIER_CENTROID_LOW_MIN_HZ` | Clause B centroid floor (currently 600) |
+| `CLASSIFIER_MID_PCT_HIGH_MIN` | Clause B mid-band ratio floor (currently 60%) |
+| `CLASSIFIER_LOW_PCT_MAX` | Backstop max below-500 Hz energy ratio (currently 60%) |
+| `CLAP_INTERVAL_S` | Max gap between consecutive claps in one sequence (0.7s) |
+| `SEQUENCE_TIMEOUT_S` | Silence after last clap before sequence finalizes (0.8s) |
 | `POST_FIRE_COOLDOWN_S` | Gate-disabled window after a successful webhook |
 | `LOG_LEVEL` | `QUIET` / `NORMAL` / `VERBOSE` |
 
 If you tune any of these, **always re-run the offline replay** (see below)
 against the test WAVs before restarting the live service.
+
+### Calibration is room-specific
+
+The classifier thresholds were tuned to a specific room with specific
+acoustics, mic placement, and typical clap distances. **Moving the sensor
+to a different room may break detection**, because:
+
+- Smaller rooms have stronger low-frequency standing waves that can push
+  `low_pct` upward
+- Soft furnishings (bedding, curtains, carpet) absorb high frequencies and
+  lower `centroid`
+- Different background noise floors can cause the gate to over- or
+  under-fire
+- Different typical mic-to-clapper distances shift the entire feature
+  distribution
+
+If you move the sensor and detection starts misbehaving, the recovery
+playbook is:
+
+1. Record a fresh ~120-second WAV of you doing 10-15 triple-claps from
+   varying positions in the new room (use the `arecord` invocation in the
+   `--replay` validation section below for the right device/format).
+2. Run `analyze_claps.py` over it to see the new spectral envelope.
+3. Adjust the classifier thresholds to admit the new envelope while still
+   rejecting the existing slam reference WAVs.
+4. Validate the new thresholds against ALL existing reference WAVs (the
+   old room's claps, the slams, and the new room's claps) to confirm no
+   regressions.
+5. Atomic-swap deploy.
+
+Keep all reference WAVs forever — they're the regression suite.
 
 ## Offline replay mode (validation gate)
 
@@ -224,15 +267,30 @@ node ../.tools/ssh-helper/run.js 192.168.50.192 martijn '<password>' \
 ## Validation history
 
 The detector was developed iteratively with empirical recordings on the
-real hardware. Final validation results before deploy:
+real hardware. Final validation results against four reference WAVs (all
+on the Pi at `/home/martijn/clap-test-{1,2,3}.wav` and
+`/home/martijn/triple-clap-test-2.wav`):
 
-| Recording | Gate triggers | Classified accepts | Classified rejects | Sequences emitted |
+| Recording | What's in it | Gate triggers | Classifier accepts | Sequences emitted |
 |---|---|---|---|---|
-| clap-test-1.wav (claps only) | 12 | **12** | 0 | 11 |
-| clap-test-2.wav (slams only) | 16 | 0 | **16** | 0 |
-| clap-test-3.wav (slams only) | 9 | 0 | **9** | 0 |
+| clap-test-1.wav | 12 point-blank claps | 12 | **12** | 9 |
+| clap-test-2.wav | 16 slams/stomps/drawer slams | 17 | **0** | 0 |
+| clap-test-3.wav | 9 slams + stomps | 11 | **0** | 0 |
+| triple-clap-test-2.wav | 15 triple-clap sequences from varying positions | 46 | **45** | 15 (all `count=3`) |
 
-And the live test session immediately after deploy: 5 real claps detected,
-7 false-positive sounds rejected, 100% accuracy with no near-misses on the
-clap side. The closest false-positive call was a sharp thud at mid_pct =
-55.5% — still 4.5 points below the 60% threshold.
+The two clap-test files calibrate the "point-blank" regime (clause B in
+the classifier). The triple-clap-test-2 file calibrates the "real-world"
+regime (clause A). The slam files are the negative regression set.
+
+The detector was redesigned several times during development. Each
+redesign corrected a different failure mode:
+
+1. **Original (`clapDetector` library)** — used post-bandpass peak
+   detection. Could not reject broadband impulses (slams) because impulses
+   contain energy at all frequencies even after aggressive filtering.
+2. **Custom spectral classifier (3-condition AND rule)** — replaced peak
+   detection with windowed FFT analysis. Worked perfectly on the original
+   point-blank calibration but rejected most real-world claps because
+   distance and reverb push the spectrum out of the narrow trained envelope.
+3. **2-clause disjunctive classifier** (current) — handles both regimes
+   with separate decision clauses, no overlap with slams on either axis.
