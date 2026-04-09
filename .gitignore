@@ -1,0 +1,7 @@
+.env
+.mcp.json
+node_modules/
+.claude/
+.cursor/
+__pycache__/
+*.pyc
