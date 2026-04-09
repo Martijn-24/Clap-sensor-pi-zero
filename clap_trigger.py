@@ -80,31 +80,43 @@ STARTUP_GRACE_S      = 0.5     # ignore gate triggers for 0.5 s after stream sta
 
 # ── Classifier ───────────────────────────────────────────────────────────────
 #
-# Empirical separation, refined from offline replay against the captured
-# WAVs (clap-test-1/2/3.wav):
+# Empirical separation, refined across three calibration datasets:
 #
-#   Real claps (12 events from test-1):
-#     centroid 735-1295 Hz, <500 Hz energy 7-24%, 500-2000 Hz energy 61-88%
+# Dataset A: clap-test-1.wav (12 point-blank claps, mic ~30cm)
+#   centroid 735-1295 Hz   low_pct 7-24%   mid_pct 61-88%
 #
-#   Slams/stomps/drawer slams etc. (25 events from test-2 + test-3):
-#     centroid 8-1149 Hz,    <500 Hz energy 47-100%, 500-2000 Hz energy 0-43%
+# Dataset B: clap-test-2.wav + clap-test-3.wav (25 slams/stomps/drawer slams)
+#   centroid 8-1149 Hz     low_pct 47-100% mid_pct 0-43%
 #
-# Note that centroid and low-band are NOT cleanly separable on their own —
-# some sharp slams (drawer cracks, wood-on-wood) push their centroid up to
-# ~1100 Hz while keeping their low-band ratio just under 60%. The (centroid,
-# low_pct) two-axis rule alone gave ~4 false positives across test-2 + test-3.
+# Dataset C: triple-clap-test-2.wav (45 claps, varying room positions)
+#   centroid 1450-2039 Hz  low_pct 0.6-12% mid_pct 33.9-73.7%
 #
-# The third axis — mid-band energy (500-2000 Hz) — IS cleanly separable:
-#   real-clap minimum: 61.3%   slam maximum: 42.9%   gap: 18 points.
+# Key observation: real-world claps and point-blank claps occupy DIFFERENT
+# regions in feature space. Real-world claps (C) have high centroid but
+# variable mid_pct. Point-blank claps (A) have moderate centroid but
+# consistently high mid_pct. There is no single 1D threshold on either axis
+# that admits all claps and rejects all slams.
 #
-# Decision rule: ALL THREE conditions must hold.
+# Decision rule (2-clause disjunction):
+#
+#   is_clap = (centroid >= 1300 Hz)
+#             OR (centroid >= 600 Hz AND mid_pct >= 60%)
+#
+#   First clause catches dataset C (real-world): centroid min 1450 Hz.
+#   Second clause catches dataset A (point-blank): mid_pct min 61%, centroid
+#       min 735 Hz.
+#   Both clauses reject dataset B (slams): max centroid 1149 Hz fails the
+#       first clause, max mid_pct 43% fails the second's mid_pct check.
+#
+# low_pct backstop kept as a sanity guard against pathological events.
 
-CLASSIFIER_WINDOW_SIZE     = 4096    # ~93 ms @ 44.1 kHz; power of two for fast rfft
-CLASSIFIER_CENTROID_MIN_HZ = 600.0   # broad guard; the mid_pct axis does the real work
-CLASSIFIER_LOW_PCT_MAX     = 60.0    # broad guard
-CLASSIFIER_MID_PCT_MIN     = 60.0    # 500-4000 Hz energy must be >= this; main discriminator
-CLASSIFIER_LOW_BAND_HZ     = 500.0
-CLASSIFIER_MID_BAND_HI_HZ  = 4000.0  # widened from 2000 to capture snappy/high-freq claps
+CLASSIFIER_WINDOW_SIZE          = 4096    # ~93 ms @ 44.1 kHz; power of two for fast rfft
+CLASSIFIER_CENTROID_HIGH_MIN_HZ = 1300.0  # first clause: high-centroid claps (real-world)
+CLASSIFIER_CENTROID_LOW_MIN_HZ  = 600.0   # second clause: lower bound for mid-heavy claps
+CLASSIFIER_MID_PCT_HIGH_MIN     = 60.0    # second clause: mid-band ratio for point-blank claps
+CLASSIFIER_LOW_PCT_MAX          = 60.0    # backstop against very-low-frequency events
+CLASSIFIER_LOW_BAND_HZ          = 500.0
+CLASSIFIER_MID_BAND_HI_HZ       = 4000.0  # captures both point-blank and snappy claps
 
 
 # ── Sequence detection (1/2/3 clap counting) ────────────────────────────────
@@ -326,22 +338,31 @@ def classify_window(window, sample_rate):
     mid_pct = 100.0 * float(energy[mid_mask].sum()) / total
     peak_hz = float(freqs[int(np.argmax(spec))])
 
-    centroid_ok = centroid >= CLASSIFIER_CENTROID_MIN_HZ
+    # 2-clause clap rule:
+    #   clause A: centroid >= 1300 Hz (real-world claps from any position)
+    #   clause B: centroid >= 600 AND mid_pct >= 60 (point-blank claps with
+    #             moderate centroid but strong mid-band)
+    # Plus a low_pct backstop against very-low-frequency events.
+    clause_a = centroid >= CLASSIFIER_CENTROID_HIGH_MIN_HZ
+    clause_b = (
+        centroid >= CLASSIFIER_CENTROID_LOW_MIN_HZ
+        and mid_pct >= CLASSIFIER_MID_PCT_HIGH_MIN
+    )
     low_ok = low_pct <= CLASSIFIER_LOW_PCT_MAX
-    mid_ok = mid_pct >= CLASSIFIER_MID_PCT_MIN
-    is_clap = centroid_ok and low_ok and mid_ok
+    is_clap = (clause_a or clause_b) and low_ok
 
     if is_clap:
         reason = "ok"
     else:
-        failures = []
-        if not centroid_ok:
-            failures.append("centroid_low")
         if not low_ok:
-            failures.append("low_band_strong")
-        if not mid_ok:
-            failures.append("mid_band_weak")
-        reason = "+".join(failures)
+            reason = "low_band_strong"
+        elif centroid < CLASSIFIER_CENTROID_LOW_MIN_HZ:
+            reason = "centroid_too_low"
+        elif centroid < CLASSIFIER_CENTROID_HIGH_MIN_HZ:
+            # In the "moderate centroid" zone, must have strong mid-band
+            reason = f"moderate_centroid_{centroid:.0f}_needs_mid_pct_60_got_{mid_pct:.0f}"
+        else:
+            reason = "unknown"
 
     return is_clap, {
         "centroid": centroid,
