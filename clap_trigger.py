@@ -38,6 +38,7 @@ import sys
 import time
 import wave
 from datetime import datetime
+from collections import deque
 from queue import Queue, Empty, Full
 from threading import Thread, Event
 
@@ -67,12 +68,21 @@ MIC_NAME_SUBSTRING  = "USB"
 # session data hit chunk RMS of 0.1-0.5; quiet room baseline is ~0.005-0.01.
 # Hysteresis avoids re-triggering on a single event's decay envelope.
 
-GATE_OPEN_THRESHOLD  = 0.04    # lowered from 0.08 — soft second claps in fast double-claps
-                                #   were missing the threshold (observed clap #2 RMS at 0.080
-                                #   exactly, with quieter ones being silently dropped). The
-                                #   classifier handles discrimination, the gate just decides
-                                #   what to look at.
-GATE_CLOSE_THRESHOLD = 0.02    # halved with the open threshold to preserve the 2:1 hysteresis
+# Fixed-floor thresholds: the gate can never go below these, even in a
+# very quiet room. They preserve the original quiet-room behavior.
+GATE_FLOOR_OPEN      = 0.04    # quiet-room minimum open threshold
+GATE_FLOOR_CLOSE     = 0.02    # quiet-room minimum close threshold
+
+# Adaptive thresholds: the gate runs a rolling-median estimate of recent
+# chunk RMS values. The dynamic open threshold is max(median * MULT_OPEN,
+# GATE_FLOOR_OPEN). This means in a quiet room the floor dominates and
+# behavior is identical to the old fixed-threshold gate; in a loud room
+# (e.g. music playing) the gate self-raises so it only fires on events
+# that genuinely stand out above the noise floor.
+GATE_ADAPT_HISTORY_S = 3.0     # how many seconds of recent RMS to track for the median
+GATE_ADAPT_MULT_OPEN = 4.0     # event must be N× above recent median to fire the gate
+GATE_ADAPT_MULT_CLOSE = 2.0    # 2:1 hysteresis preserved, applied to dynamic threshold
+
 GATE_REFRACTORY_S    = 0.04    # ignore further triggers for 40 ms after close
 GATE_CLOSE_HOLD      = 2       # need this many consecutive sub-close chunks to confirm close
 STARTUP_GRACE_S      = 0.5     # ignore gate triggers for 0.5 s after stream start
@@ -251,7 +261,14 @@ class RingBuffer:
 # ── Gate ─────────────────────────────────────────────────────────────────────
 
 class Gate:
-    """RMS envelope gate with hysteresis and a refractory period.
+    """Adaptive RMS envelope gate with hysteresis and a refractory period.
+
+    Maintains a rolling-median estimate of recent chunk RMS values. The
+    dynamic open/close thresholds are derived from the median scaled by
+    GATE_ADAPT_MULT_*, with a fixed floor that preserves quiet-room
+    behavior. This lets the gate ignore steady background sound (e.g.
+    music) and only fire on events that genuinely stand out above the
+    current noise floor.
 
     Call `process_chunk(rms, abs_start_index, now)` once per audio chunk.
     Returns the absolute sample index of the chunk that opened the gate, or
@@ -269,37 +286,62 @@ class Gate:
         self.startup_until = _clock_now() + STARTUP_GRACE_S
         self.cooldown_until = 0.0
 
+        # Rolling RMS history for adaptive thresholding. Sized to hold
+        # ~GATE_ADAPT_HISTORY_S worth of chunks.
+        history_len = max(8, int(GATE_ADAPT_HISTORY_S * SAMPLE_RATE / CHUNK_SIZE))
+        self.rms_history = deque(maxlen=history_len)
+
     def set_cooldown(self, until_monotonic):
         self.cooldown_until = until_monotonic
 
+    def _dynamic_thresholds(self):
+        """Compute current open/close thresholds from the rolling RMS median.
+        Returns (open_thr, close_thr, median_used).
+        """
+        if len(self.rms_history) < 4:
+            return GATE_FLOOR_OPEN, GATE_FLOOR_CLOSE, 0.0
+        # Sorted-list median is fine for our small history (~130 entries)
+        sorted_h = sorted(self.rms_history)
+        median = sorted_h[len(sorted_h) // 2]
+        open_thr = max(median * GATE_ADAPT_MULT_OPEN, GATE_FLOOR_OPEN)
+        close_thr = max(median * GATE_ADAPT_MULT_CLOSE, GATE_FLOOR_CLOSE)
+        return open_thr, close_thr, median
+
     def process_chunk(self, rms, abs_start_index, now):
+        # Always update the rolling history, regardless of state. Even
+        # during refractory we want to know what the room sounds like.
+        self.rms_history.append(rms)
+
         # Startup grace
         if now < self.startup_until:
-            if rms > GATE_OPEN_THRESHOLD:
-                log_event("GRACE_SKIP", rms=rms)
             return None
 
         # Post-fire cooldown disables the gate entirely
         if now < self.cooldown_until:
-            if rms > GATE_OPEN_THRESHOLD:
-                log_event("COOLDOWN_SKIP", rms=rms)
             return None
 
+        open_thr, close_thr, _median = self._dynamic_thresholds()
+
         if self.state == self.QUIET:
-            if rms >= GATE_OPEN_THRESHOLD:
+            if rms >= open_thr:
                 self.state = self.OPEN
                 self.close_hold_count = 0
-                log_event("GATE_OPEN", rms=rms, sample_idx=abs_start_index)
+                log_event(
+                    "GATE_OPEN",
+                    rms=rms,
+                    sample_idx=abs_start_index,
+                    thr_open=open_thr,
+                )
                 return abs_start_index
             return None
 
         if self.state == self.OPEN:
-            if rms < GATE_CLOSE_THRESHOLD:
+            if rms < close_thr:
                 self.close_hold_count += 1
                 if self.close_hold_count >= GATE_CLOSE_HOLD:
                     self.state = self.REFRACTORY
                     self.refractory_until = now + GATE_REFRACTORY_S
-                    log_event("GATE_CLOSE", rms=rms)
+                    log_event("GATE_CLOSE", rms=rms, thr_close=close_thr)
             else:
                 self.close_hold_count = 0
             return None
