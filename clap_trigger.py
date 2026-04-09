@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 import pyaudio
 import requests
 from clapDetector import ClapDetector
@@ -10,6 +11,15 @@ WEBHOOK_URL = "http://192.168.50.76:5678/webhook/clap"
 THRESHOLD_BIAS = 6000
 LOWCUT         = 200
 HIGHCUT        = 3200
+
+# Set to True to log every non-empty detector result with full repr,
+# including counts the webhook ignores (0, 4+). Useful for tuning.
+DEBUG_DETECTIONS = True
+
+
+def ts():
+    """Wallclock with millisecond precision for log correlation."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 # ── Webhook sender ─────────────────────────────────────────────────────────────
 
@@ -75,10 +85,24 @@ def main():
                 audioData=audioData
             )
             count = len(result)
+
+            # Log every non-empty result (incl. dropped counts) for tuning.
+            if DEBUG_DETECTIONS and count > 0:
+                print(
+                    f"[{ts()}] DETECT count={count} repr={result!r}",
+                    flush=True,
+                )
+
             if count in (1, 2, 3):
-                print(f"Detected {count} clap(s)!")
+                print(f"Detected {count} clap(s)!", flush=True)
                 trigger_webhook(count)
                 time.sleep(1)
+            elif count > 3:
+                # Currently dropped — surface it so we know if it's happening.
+                print(
+                    f"[{ts()}] DROPPED count={count} (out of 1..3 range)",
+                    flush=True,
+                )
 
     except KeyboardInterrupt:
         print("\nStopped.")
