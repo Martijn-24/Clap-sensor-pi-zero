@@ -67,8 +67,12 @@ MIC_NAME_SUBSTRING  = "USB"
 # session data hit chunk RMS of 0.1-0.5; quiet room baseline is ~0.005-0.01.
 # Hysteresis avoids re-triggering on a single event's decay envelope.
 
-GATE_OPEN_THRESHOLD  = 0.08    # ~peak int16 ~2600
-GATE_CLOSE_THRESHOLD = 0.04    # ~peak int16 ~1300, must close before re-arming
+GATE_OPEN_THRESHOLD  = 0.04    # lowered from 0.08 — soft second claps in fast double-claps
+                                #   were missing the threshold (observed clap #2 RMS at 0.080
+                                #   exactly, with quieter ones being silently dropped). The
+                                #   classifier handles discrimination, the gate just decides
+                                #   what to look at.
+GATE_CLOSE_THRESHOLD = 0.02    # halved with the open threshold to preserve the 2:1 hysteresis
 GATE_REFRACTORY_S    = 0.04    # ignore further triggers for 40 ms after close
 GATE_CLOSE_HOLD      = 2       # need this many consecutive sub-close chunks to confirm close
 STARTUP_GRACE_S      = 0.5     # ignore gate triggers for 0.5 s after stream start
